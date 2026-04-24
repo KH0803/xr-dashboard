@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useMemo } from 'react'
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
+import { store } from '../lib/store'
 import {
   RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
@@ -7,7 +8,7 @@ import {
   AreaChart, Area, ComposedChart, ReferenceLine
 } from 'recharts'
 
-interface Props { pid: string; name: string }
+interface Props { pid: string; name: string; apiKey?: string }
 
 const GAZE_COLORS = ['#3fb950', '#58a6ff', '#f85149']
 const EVENT_COLORS: Record<string, string> = {
@@ -176,7 +177,7 @@ const SECTIONS = [
   { id: 'feedback',   label: '🤖 AI 피드백' },
 ]
 
-export default function Dashboard({ pid, name }: Props) {
+export default function Dashboard({ pid, name, apiKey = '' }: Props) {
   const [data, setData]               = useState<any>(null)
   const [feedback, setFeedback]       = useState<any>(null)
   const [fbLoading, setFbLoading]     = useState(false)
@@ -184,28 +185,33 @@ export default function Dashboard({ pid, name }: Props) {
   const [selectedSession, setSelectedSession] = useState(0)
   const [interp, setInterp]           = useState<Set<string>>(new Set())
   const [uploadingVideo, setUploadingVideo] = useState(false)
+  const [localVideos, setLocalVideos] = useState<Array<{ name: string; url: string; session: string }>>([])
   const videoRef = useRef<HTMLInputElement>(null)
 
   const toggleInterp = (id: string) => setInterp(prev => {
     const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next
   })
 
-  useEffect(() => {
-    setData(null); setFeedback(null); setSelectedSession(0); setInterp(new Set())
-    fetch(`/api/dashboard/${pid}`).then(r => r.json()).then(d => {
-      setData(d)
-      setSelectedSession((d.sessions?.length || 1) - 1)
-    })
+  const loadData = useCallback(() => {
+    const d = store.buildDashboard(pid)
+    setData(d)
+    if (!('error' in d)) setSelectedSession((d.sessions?.length || 1) - 1)
   }, [pid])
+
+  useEffect(() => {
+    setData(null); setFeedback(null); setSelectedSession(0); setInterp(new Set()); setLocalVideos([])
+    loadData()
+  }, [pid, loadData])
 
   // Derive current session — must be before any early returns (hooks rule)
   const sess = useMemo(
     () => data?.sessions?.[selectedSession] ?? data?.sessions?.[data?.sessions?.length - 1],
     [data, selectedSession]
   )
-  const eventLog = useMemo(() => { try { return JSON.parse(sess?.event_log || '[]') } catch { return [] } }, [sess])
-  const emotionTimeline = useMemo(() => { try { return JSON.parse(sess?.emotion_timeline || '[]') } catch { return [] } }, [sess])
-  const cognitiveTimeline = useMemo(() => { try { return JSON.parse(sess?.cognitive_timeline || '[]') } catch { return [] } }, [sess])
+  const parseField = (v: any) => Array.isArray(v) ? v : (() => { try { return JSON.parse(v || '[]') } catch { return [] } })()
+  const eventLog        = useMemo(() => parseField(sess?.event_log),        [sess])
+  const emotionTimeline = useMemo(() => parseField(sess?.emotion_timeline),  [sess])
+  const cognitiveTimeline = useMemo(() => parseField(sess?.cognitive_timeline), [sess])
 
   if (!data) return <div style={{ padding: 40, color: 'var(--muted)' }}>데이터 로딩 중...</div>
   if (data.error) return <div style={{ padding: 40, color: 'var(--red)' }}>{data.error}</div>
@@ -261,20 +267,51 @@ export default function Dashboard({ pid, name }: Props) {
   ) : null
 
   const getAiFeedback = async () => {
+    const key = apiKey || store.getApiKey()
+    if (!key) { alert('AI 피드백을 사용하려면 왼쪽 사이드바에서 Anthropic API 키를 설정해주세요.'); return }
     setFbLoading(true)
-    const res = await fetch(`/api/feedback/${pid}`, { method: 'POST' }).then(r => r.json())
-    setFeedback(res); setFbLoading(false)
+    const allScores: number[] = data?.all_scores || []
+    const avg = allScores.length ? allScores.reduce((a, b) => a + b, 0) / allScores.length : 50
+    const pctVal = allScores.length ? Math.round(allScores.filter(v => v < score).length / allScores.length * 100) : 50
+    const prompt = `XR 시뮬레이션 학습자의 수행 데이터를 분석하고 성찰적 피드백을 제공하세요.
+
+[수행 데이터]
+- 행동 총점: ${sess.behavior_total.toFixed(1)}/100 (집단 평균: ${avg.toFixed(1)}, 백분위: ${pctVal}%)
+- 의사소통: ${sess.behavior_communication.toFixed(1)} / 절차수행: ${sess.behavior_procedure.toFixed(1)} / 의사결정: ${sess.behavior_decision.toFixed(1)}
+- 과제완성률: ${sess.action_completion.toFixed(1)}% / 오류횟수: ${sess.error_count.toFixed(0)}회 / 최적경로: ${sess.optimal_path_rate.toFixed(1)}%
+- 시선집중도: ${sess.gaze_focus_rate.toFixed(1)}% / 과제영역시선: ${sess.gaze_task_area.toFixed(1)}%
+- 인지부하: ${sess.cognitive_load.toFixed(1)} / 정신적 노력: ${sess.mental_effort.toFixed(1)}
+- 긍정정서: ${sess.emotion_positive.toFixed(1)} / 부정정서: ${sess.emotion_negative.toFixed(1)}
+- 총 소요시간: ${sess.time_total.toFixed(0)}초 / 과제시간: ${sess.time_on_task.toFixed(0)}초
+
+다음 JSON 형식으로만 응답하세요:
+{"strengths":["잘한 점 2-3가지"],"improvements":["개선할 점 2-3가지"],"next_steps":["다음 단계 행동 2-3가지"],"reflection_questions":["성찰 질문 3가지"],"overall":"전체 성찰 메시지 (2-3문장)"}`
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': key,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 900,
+          messages: [{ role: 'user', content: prompt }] }),
+      })
+      const json = await res.json()
+      if (json.error) throw new Error(json.error.message)
+      let text = json.content?.[0]?.text?.trim() || ''
+      if (text.includes('```')) text = text.split('```')[1].replace(/^json/, '').trim()
+      setFeedback(JSON.parse(text))
+    } catch (e: any) {
+      alert('AI 피드백 오류: ' + e.message)
+    }
+    setFbLoading(false)
   }
 
-  const uploadVideo = async (file: File) => {
-    setUploadingVideo(true)
-    const fd = new FormData()
-    fd.append('file', file)
-    fd.append('participant_id', pid)
-    fd.append('session_label', sess?.session_label || 'Session 1')
-    await fetch('/api/video/upload', { method: 'POST', body: fd })
-    const updated = await fetch(`/api/dashboard/${pid}`).then(r => r.json())
-    setData(updated); setUploadingVideo(false)
+  const uploadVideo = (file: File) => {
+    const url = URL.createObjectURL(file)
+    setLocalVideos(prev => [...prev, { name: file.name, url, session: sess?.session_label || 'Session' }])
   }
 
   const tooltipStyle = { background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 6 }
@@ -419,7 +456,7 @@ export default function Dashboard({ pid, name }: Props) {
             </button>
           </div>
 
-          {(!data.videos || data.videos.length === 0) && (
+          {localVideos.length === 0 && (
             <div className="empty-state" style={{ padding: '40px 24px' }}>
               <div className="empty-icon">🎬</div>
               <div className="empty-title">업로드된 영상이 없어요</div>
@@ -427,18 +464,16 @@ export default function Dashboard({ pid, name }: Props) {
             </div>
           )}
 
-          {data.videos?.map((v: any, i: number) => (
+          {localVideos.map((v, i) => (
             <div className="card" key={i} style={{ marginBottom: 16 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10 }}>
                 <div>
-                  <div style={{ fontWeight: 600, marginBottom: 2 }}>{v.original_name}</div>
-                  <div style={{ fontSize: 11, color: 'var(--muted)' }}>
-                    {v.session_label} · {String(v.created_at ?? '').split('T')[0]}
-                  </div>
+                  <div style={{ fontWeight: 600, marginBottom: 2 }}>{v.name}</div>
+                  <div style={{ fontSize: 11, color: 'var(--muted)' }}>{v.session}</div>
                 </div>
               </div>
               <video controls style={{ width: '100%', borderRadius: 8, background: '#000', maxHeight: 480 }}
-                src={`/api/video/stream/${v.filename}`} />
+                src={v.url} />
               <div style={{ marginTop: 10, padding: '10px 12px', background: 'var(--bg3)', borderRadius: 6,
                 fontSize: 12, color: 'var(--muted)', borderLeft: '3px solid var(--blue)' }}>
                 💡 영상을 보면서 질문해보세요: 어떤 순간에 망설였나요? 더 빠른 결정을 내릴 수 있었던 순간은?
